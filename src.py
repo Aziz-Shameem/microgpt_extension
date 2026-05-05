@@ -298,8 +298,7 @@ def gpt_with_alibi(token_id, pos_id, keys, values):
 def gpt_with_rope(token_id, pos_id, keys, values):
     tok_emb = state_dict['wte'][token_id] # token embedding
 
-    num_blocks = head_dim // 2 # number of 2D blocks in the embedding (for 2D rotary embeddings) - applied independently for each head
-    rotation_matrices = [R_matrix(pos_id, 10000**(-2*block_id/head_dim)) for block_id in range(num_blocks)] # precompute rotation matrices for each block
+    rotation_matrices = [R_matrix(pos_id, 10000**(-2*block_id/head_dim)) for block_id in range(head_dim // 2)] # precompute rotation matrices for each block
     rotation_matrices = rotation_matrices * n_head # repeat for each head - apply rope to each head independently
     rotation_matrix_full = build_rotation_matrix(rotation_matrices, n_embd)
 
