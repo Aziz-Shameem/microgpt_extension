@@ -24,6 +24,8 @@ class Value:
     def __pow__(self, other): return Value(self.data**other, (self,), (other * self.data**(other-1),))
     def log(self): return Value(math.log(self.data), (self,), (1/self.data,))
     def exp(self): return Value(math.exp(self.data), (self,), (math.exp(self.data),))
+    def cos(self): return Value(math.cos(self.data), (self,), (-math.sin(self.data),))
+    def sin(self): return Value(math.sin(self.data), (self,), (math.cos(self.data),))
     def relu(self): return Value(max(0, self.data), (self,), (float(self.data > 0),))
     def __neg__(self): return self * -1
     def __radd__(self, other): return self + other
