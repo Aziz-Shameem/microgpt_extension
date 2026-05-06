@@ -7,7 +7,7 @@ from models import MODEL_REGISTRY
 from utils import Value, softmax
 
 def call_model(model_fn, token_id, pos_id, keys, values, state_dict, n_layer, n_head, 
-               head_dim, heads_per_group, n_embd, block_size, kv_chunk_size):
+               head_dim, heads_per_group, n_tokens, n_embd, block_size, kv_chunk_size):
     """Wrapper to call model functions with the correct parameters."""
     # Get model name by checking function name
     model_name = model_fn.__name__.replace('gpt_', '')
@@ -30,6 +30,9 @@ def call_model(model_fn, token_id, pos_id, keys, values, state_dict, n_layer, n_
     elif model_name == 'flash':
         return model_fn(token_id, pos_id, keys, values, state_dict, n_layer, n_head, 
                        head_dim, heads_per_group, kv_chunk_size)
+    elif model_name == 'mtp_naive':
+        return model_fn(token_id, pos_id, keys, values, state_dict, n_layer, n_head, 
+                       head_dim, heads_per_group, n_tokens)
     else:
         raise ValueError(f"Unknown model: {model_name}")
 
@@ -105,7 +108,7 @@ for encoded_doc in encoded_docs :
 bigrams = {k:v for k,v in sorted(bigrams.items(), key=lambda item: item[1], reverse=True)}
 
 # iterations, put 0 for no bpe
-n_iter = 0
+n_iter = 10
 for _ in range(n_iter) :
     bigrams, encoding, decoding, encoded_docs = run_bpe(bigrams, encoding, decoding, encoded_docs)
 
@@ -128,8 +131,15 @@ assert n_head % n_group == 0, "number of heads must be divisible by number of n_
 heads_per_group = n_head // n_group
 head_dim = n_embd // n_head # derived dimension of each head
 kv_chunk_size = 2 # for FlashAttention - number of groups to process together for efficiency (e.g. 2 groups = 2*head_dim dims for k and v)
+n_tokens = 3 # for multi-token prediction
 matrix = lambda nout, nin, std=0.08: [[Value(random.gauss(0, std)) for _ in range(nin)] for _ in range(nout)]
-state_dict = {'wte': matrix(vocab_size, n_embd), 'wpe': matrix(block_size, n_embd), 'lm_head': matrix(vocab_size, n_embd)}
+state_dict = {
+    'wte': matrix(vocab_size, n_embd), 
+    'wpe': matrix(block_size, n_embd), 
+    'lm_head': matrix(vocab_size, n_embd)
+    }
+for i in range(2, n_tokens+1) :
+    state_dict[f'lm_head{i}'] = matrix(vocab_size, n_embd) # for mtp
 for i in range(n_layer):
     state_dict[f'layer{i}.attn_wq'] = matrix(n_embd, n_embd)
     state_dict[f'layer{i}.attn_wk'] = matrix(n_embd, n_group*head_dim)
@@ -138,7 +148,6 @@ for i in range(n_layer):
     state_dict[f'layer{i}.mlp_fc1'] = matrix(4 * n_embd, n_embd)
     state_dict[f'layer{i}.mlp_fc2'] = matrix(n_embd, 4 * n_embd)
     state_dict[f'layer{i}.rel_pos_bias'] = matrix(n_head, 2*block_size+1) # T5-style relative positional bias
-    state_dict[f'layer{i}.alibi_bias'] = matrix(n_head, 1) # ALiBi relative positional bias
 
 params = [p for mat in state_dict.values() for row in mat for p in row] # flatten params into a single list[Value]
 print(f"num params: {len(params)}")
@@ -170,13 +179,21 @@ def main():
         losses = []
         for pos_id in range(n):
             token_id, target_id = tokens[pos_id], tokens[pos_id + 1]
-            
+            target_ids = [target_id] + [tokens[pos_id + i] if pos_id + i < len(tokens) else None for i in range(2, n_tokens + 1)]
+
             # Call the model with the wrapper function
             logits = call_model(model_fn, token_id, pos_id, keys, values, state_dict, n_layer, n_head, 
-                              head_dim, heads_per_group, n_embd, block_size, kv_chunk_size)
+                              head_dim, heads_per_group, n_tokens, n_embd, block_size, kv_chunk_size)
             
-            probs = softmax(logits)
-            loss_t = -probs[target_id].log()
+            if isinstance(logits[0], list) :
+                loss_t = 0.0
+                probs = [softmax(logits[i]) for i in range(len(logits))] # compute probabilities for each token
+                for i, (prob, target_id) in enumerate(zip(probs, target_ids)) :
+                    if target_id is not None:
+                        loss_t -= (1.0/(i+1))*prob[target_id].log()
+            else :
+                probs = softmax(logits)
+                loss_t = -probs[target_id].log()
             losses.append(loss_t)
         loss = (1 / n) * sum(losses) # final average loss over the document sequence. 
 
@@ -207,7 +224,8 @@ def main():
         sample = []
         for pos_id in range(block_size):
             logits = call_model(model_fn, token_id, pos_id, keys, values, state_dict, n_layer, n_head, 
-                              head_dim, heads_per_group, n_embd, block_size, kv_chunk_size)
+                              head_dim, heads_per_group, n_tokens, n_embd, block_size, kv_chunk_size)
+            if isinstance(logits[0], list) : logits = logits[0] # using only the next token prediction
             probs = softmax([l / temperature for l in logits])
             token_id = random.choices(range(vocab_size), weights=[p.data for p in probs])[0]
             if token_id == BOS:
