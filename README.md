@@ -198,10 +198,31 @@ The fastest way to deeply understand LLMs is to reconstruct them.
 ```text
 microgpt_extension/
 │
-├── src/         # All implementations
-├── utils/         # Contains the Value class 
-├── resources/        # Related papers 
+├── models/             # Modular model implementations
+│   ├── __init__.py     # Model registry
+│   ├── baseline.py     # Baseline with absolute positional embeddings
+│   ├── rope.py         # Rotary Position Embeddings
+│   ├── alibi.py        # Attention with Linear Biases
+│   ├── t5_bias.py      # T5-style relative positional bias
+│   ├── flash.py        # Flash Attention
+│   └── xpos.py         # xPOS (extrapolation-friendly positions)
+├── src.py              # Core algorithm and utilities (dataset, BPE, etc.)
+├── utils.py            # Value class for autograd
+├── train.py            # Training script with model selection
+├── config.py           # Configuration
+├── input.txt           # Dataset
+└── resources/          # Related papers
 ```
+
+---
+
+## Using Different Models
+
+The codebase is organized as follows:
+
+Each model variant is now in its own file under the `models/` directory for better readability and modularity. The `models/__init__.py` file contains a `MODEL_REGISTRY` that maps model names to their implementations.
+
+To train or experiment with a specific model architecture, simply use the `--model` flag when running `train.py`.
 
 ---
 
@@ -211,47 +232,9 @@ microgpt_extension/
 |---------|----------|
 | Tokenization | BPE |
 | Attention | Standard MHA, Flash Attention, MQA, GQA |
-| Positional Encoding | Learned, RoPE, ALiBi, T5 Bias |
-| Training | GPT training loop |
+| Positional Encoding | Learned, RoPE, ALiBi, T5 Bias, xPOS |
+| Training | GPT training loop with model selection |
 | Inference | Autoregressive decoding |
-
----
-
-## Suggested Experiments
-
-If you're exploring this repo, try:
-
-### Compare positional methods
-
-Train identical models with:
-
-- RoPE
-- ALiBi
-- T5 Bias
-
-Observe convergence and extrapolation differences.
-
----
-
-### Benchmark attention variants
-
-Compare:
-
-- MHA
-- MQA
-- GQA
-
-Track:
-
-- Memory usage
-- Speed
-- Quality
-
----
-
-### Modify context length
-
-Study how each positional strategy behaves beyond training context.
 
 ---
 
@@ -302,12 +285,36 @@ Potential additions:
 
 ## Running
 
+Train a model with a specific architecture:
+
 ```bash
-# change the function call in train and infer 
-# with the required function 
-# [ eg:gpt_with_rope() ]
-python3 src.py 
+# Train with baseline model (default)
+python3 train.py
+
+# Train with RoPE positional embeddings
+python3 train.py --model rope
+
+# Train with ALiBi
+python3 train.py --model alibi
+
+# Train with T5 relative positional bias
+python3 train.py --model t5_bias
+
+# Train with Flash Attention
+python3 train.py --model flash
+
+# Train with xPOS
+python3 train.py --model xpos
+
+# Customize training steps and samples
+python3 train.py --model rope --num-steps 1000 --num-samples 50
 ```
+
+### Command Line Arguments
+
+- `--model {baseline,rope,alibi,t5_bias,flash,xpos}`: Choose model architecture (default: baseline)
+- `--num-steps`: Number of training steps (default: 500)
+- `--num-samples`: Number of inference samples to generate (default: 20)
 
 ---
 
