@@ -97,8 +97,11 @@ assert n_head % n_group == 0, "number of heads must be divisible by number of n_
 heads_per_group = n_head // n_group
 head_dim = n_embd // n_head # derived dimension of each head
 kv_chunk_size = 2 # number of groups to process together for efficiency (e.g. 2 groups = 2*head_dim dims for k and v)
+n_tokens = 3 # for multi-token prediction
 matrix = lambda nout, nin, std=0.08: [[Value(random.gauss(0, std)) for _ in range(nin)] for _ in range(nout)]
 state_dict = {'wte': matrix(vocab_size, n_embd), 'wpe': matrix(block_size, n_embd), 'lm_head': matrix(vocab_size, n_embd)}
+for i in range(2, n_tokens+1) :
+    state_dict[f'lm_head{i}'] = matrix(vocab_size, n_embd) # for mtp
 for i in range(n_layer):
     state_dict[f'layer{i}.attn_wq'] = matrix(n_embd, n_embd)
     state_dict[f'layer{i}.attn_wk'] = matrix(n_embd, n_group*head_dim)
@@ -341,6 +344,60 @@ def gpt_with_rope(token_id, pos_id, keys, values):
     logits = linear(x, state_dict['lm_head'])
     return logits
 
+def gpt_with_xpos(token_id, pos_id, keys, values):
+    tok_emb = state_dict['wte'][token_id] # token embedding
+
+    rotation_matrices = [R_matrix(pos_id, 10000**(-2*block_id/head_dim)) for block_id in range(head_dim // 2)] # precompute rotation matrices for each block
+    rotation_matrices = rotation_matrices * n_head # repeat for each head - apply rope to each head independently
+    rotation_matrix_full = build_rotation_matrix(rotation_matrices, n_embd)
+
+    gamma = 0.4 # hparam, xpos->rope as gamma->infinity
+    zeta = lambda i, d : ((2*i/d) + gamma)/(1 + gamma)
+    T = [Value(0.0) for _ in range(n_embd)] # the transformation vector for XPos, initialized to zero
+    for i, ind in enumerate(list(range(head_dim))*n_head) :
+        T[i] = Value(zeta(ind//2, head_dim))
+
+    x = tok_emb 
+    x = rmsnorm(x) # note: not redundant due to backward pass via the residual connection
+
+    for li in range(n_layer):
+        # 1) Multi-head Attention block
+        x_residual = x
+        x = rmsnorm(x)
+        q = linear(x, state_dict[f'layer{li}.attn_wq'])
+        q_with_position = matrix_mul(rotation_matrix_full, [[qi] for qi in q]) # apply RoPE rotation to the query
+        q__with_position_with_decay = [[q_with_position[i][0] * T[i]**pos_id] for i in range(len(q_with_position))] # apply XPos decay to the RoPE-rotated query
+        q__with_position_with_decay = [x[0] for x in q__with_position_with_decay] 
+        k = linear(x, state_dict[f'layer{li}.attn_wk'])
+        k_with_position = matrix_mul(rotation_matrix_full, [[ki] for ki in k]) # apply RoPE rotation to the key
+        k_with_position_with_decay = [[k_with_position[i][0] * T[i]**(-pos_id)] for i in range(len(k_with_position))] # apply XPos decay to the RoPE-rotated key
+        v = linear(x, state_dict[f'layer{li}.attn_wv'])
+        keys[li].append([x[0] for x in k_with_position_with_decay])
+        values[li].append(v)
+        x_attn = []
+        for h in range(n_head):
+            hs = h * head_dim
+            hs_kv = (h // heads_per_group) * head_dim
+            q_h = q__with_position_with_decay[hs:hs+head_dim]
+            k_h = [ki[hs_kv:hs_kv+head_dim] for ki in keys[li]]
+            v_h = [vi[hs_kv:hs_kv+head_dim] for vi in values[li]]
+            attn_logits = [sum(q_h[j] * k_h[t][j] for j in range(head_dim)) / head_dim**0.5 for t in range(len(k_h))]
+            attn_weights = softmax(attn_logits)
+            head_out = [sum(attn_weights[t] * v_h[t][j] for t in range(len(v_h))) for j in range(head_dim)]
+            x_attn.extend(head_out)
+        x = linear(x_attn, state_dict[f'layer{li}.attn_wo'])
+        x = [a + b for a, b in zip(x, x_residual)]
+        # 2) MLP block
+        x_residual = x
+        x = rmsnorm(x)
+        x = linear(x, state_dict[f'layer{li}.mlp_fc1'])
+        x = [xi.relu() for xi in x]
+        x = linear(x, state_dict[f'layer{li}.mlp_fc2'])
+        x = [a + b for a, b in zip(x, x_residual)]
+
+    logits = linear(x, state_dict['lm_head'])
+    return logits
+
 def gpt_flash_attention(token_id, pos_id, keys, values):
     tok_emb = state_dict['wte'][token_id] # token embedding
     pos_emb = state_dict['wpe'][pos_id] # position embedding
@@ -401,6 +458,47 @@ def gpt_flash_attention(token_id, pos_id, keys, values):
     logits = linear(x, state_dict['lm_head'])
     return logits
 
+def gpt_mtp_naive(token_id, pos_id, keys, values):
+    tok_emb = state_dict['wte'][token_id] # token embedding
+    pos_emb = state_dict['wpe'][pos_id] # position embedding
+    x = [t + p for t, p in zip(tok_emb, pos_emb)] # joint token and position embedding
+    # x = [t for t, p in zip(tok_emb, pos_emb)] # not adding PE
+    x = rmsnorm(x) # note: not redundant due to backward pass via the residual connection
+
+    for li in range(n_layer):
+        # 1) Multi-head Attention block
+        x_residual = x
+        x = rmsnorm(x)
+        q = linear(x, state_dict[f'layer{li}.attn_wq'])
+        k = linear(x, state_dict[f'layer{li}.attn_wk'])
+        v = linear(x, state_dict[f'layer{li}.attn_wv'])
+        keys[li].append(k)
+        values[li].append(v)
+        x_attn = []
+        for h in range(n_head):
+            hs = h * head_dim
+            hs_kv = (h // heads_per_group) * head_dim
+            q_h = q[hs:hs+head_dim]
+            k_h = [ki[hs_kv:hs_kv+head_dim] for ki in keys[li]]
+            v_h = [vi[hs_kv:hs_kv+head_dim] for vi in values[li]]
+            attn_logits = [sum(q_h[j] * k_h[t][j] for j in range(head_dim)) / head_dim**0.5 for t in range(len(k_h))]
+            attn_weights = softmax(attn_logits)
+            head_out = [sum(attn_weights[t] * v_h[t][j] for t in range(len(v_h))) for j in range(head_dim)]
+            x_attn.extend(head_out)
+        x = linear(x_attn, state_dict[f'layer{li}.attn_wo'])
+        x = [a + b for a, b in zip(x, x_residual)]
+        # 2) MLP block
+        x_residual = x
+        x = rmsnorm(x)
+        x = linear(x, state_dict[f'layer{li}.mlp_fc1'])
+        x = [xi.relu() for xi in x]
+        x = linear(x, state_dict[f'layer{li}.mlp_fc2'])
+        x = [a + b for a, b in zip(x, x_residual)]
+
+    logits = linear(x, state_dict['lm_head'])
+    logits_additional = [linear(x, state_dict[f'lm_head{i}']) for i in range(2, n_tokens + 1)] # additional heads for MTP
+    return [logits] + logits_additional
+
 # Let there be Adam, the blessed optimizer and its buffers
 learning_rate, beta1, beta2, eps_adam = 0.01, 0.85, 0.99, 1e-8
 m = [0.0] * len(params) # first moment buffer
@@ -421,9 +519,18 @@ for step in range(num_steps):
     losses = []
     for pos_id in range(n):
         token_id, target_id = tokens[pos_id], tokens[pos_id + 1]
-        logits = gpt_with_rope(token_id, pos_id, keys, values)
-        probs = softmax(logits)
-        loss_t = -probs[target_id].log()
+        target_ids = [target_id] + [tokens[pos_id + i] if pos_id + i < len(tokens) else None for i in range(2, n_tokens + 1)]
+
+        logits = gpt_mtp_naive(token_id, pos_id, keys, values)
+        if isinstance(logits[0], list) :
+            loss_t = 0.0
+            probs = [softmax(logits[i]) for i in range(len(logits))] # compute probabilities for each token
+            for i, (prob, target_id) in enumerate(zip(probs, target_ids)) :
+                if target_id is not None:
+                    loss_t -= (1.0/(i+1))*prob[target_id].log()
+        else :
+            probs = softmax(logits)
+            loss_t = -probs[target_id].log()
         losses.append(loss_t)
     loss = (1 / n) * sum(losses) # final average loss over the document sequence. May yours be low.
 
@@ -452,7 +559,8 @@ for sample_idx in range(20):
     token_id = BOS
     sample = []
     for pos_id in range(block_size):
-        logits = gpt_with_rope(token_id, pos_id, keys, values)
+        logits = gpt_mtp_naive(token_id, pos_id, keys, values)
+        if isinstance(logits[0], list) : logits = logits[0]
         probs = softmax([l / temperature for l in logits])
         token_id = random.choices(range(vocab_size), weights=[p.data for p in probs])[0]
         if token_id == BOS:
@@ -460,37 +568,34 @@ for sample_idx in range(20):
         sample.append(decoding[token_id])
     print(f"sample {sample_idx+1:2d}: {''.join(sample)}")
 
-# Inference with BPE tokens: generate new tokens in continuation
-# temperature = 0.5 # in (0, 1], control the "creativity" of generated text, low to high
-# print("\n--- inference (new, hallucinated names with BPE) ---")
+
 # for sample_idx in range(20):
 #     keys, values = [[] for _ in range(n_layer)], [[] for _ in range(n_layer)]
-#     # Start with a newline token (BOS marker in BPE encoding)
-#     sample_tokens = [encoding['\n']]
-    
-#     # Generate tokens continuously for n iterations
-#     n_generate = 20  # number of tokens to generate
-#     for gen_step in range(n_generate):
-#         token_id = sample_tokens[-1]
-#         # Use modulo to wrap position within block_size
-#         pos_id = gen_step % block_size
-#         logits = gpt(token_id, pos_id, keys, values)
-#         probs = softmax([l / temperature for l in logits])
-#         next_token = random.choices(range(vocab_size), weights=[p.data for p in probs])[0]
-#         sample_tokens.append(next_token)
-        
-#         # Maintain context window: keep only last block_size tokens in KV cache
-#         if len(keys[0]) > block_size:
-#             for li in range(n_layer):
-#                 keys[li] = keys[li][-block_size:]
-#                 values[li] = values[li][-block_size:]
-    
-#     # Decode all tokens to text
-#     sample_text = ''
-#     for token_id in sample_tokens:
-#         token_str = decoding.get(token_id, '?')
-#         sample_text += token_str
-    
-#     # Remove the leading/trailing newlines for display
-#     sample_text = sample_text.strip()
-#     print(f"sample {sample_idx+1:2d}: {sample_text}")
+#     token_id = BOS
+#     sample = []
+#     pos_id = 0
+#     while pos_id < block_size:
+#         logits = gpt_mtp_naive(token_id, pos_id, keys, values)
+#         if isinstance(logits, list) :
+#             logits, logits2 = logits 
+#             probs = softmax([l / temperature for l in logits])
+#             probs2 = softmax([l / temperature for l in logits2])
+#             token_id = random.choices(range(vocab_size), weights=[p.data for p in probs])[0]
+#             token_id2 = random.choices(range(vocab_size), weights=[p.data for p in probs2])[0]
+#             if token_id == BOS:
+#                 break
+#             sample.append(decoding[token_id])
+#             pos_id += 1
+#             if token_id2 == BOS:
+#                 break
+#             sample.append(decoding[token_id2])
+#             pos_id += 1
+#         else :
+#             probs = softmax([l / temperature for l in logits])
+#             token_id = random.choices(range(vocab_size), weights=[p.data for p in probs])[0]
+#             if token_id == BOS:
+#                 break
+#             sample.append(decoding[token_id])
+#             pos_id += 1
+#     print(f"sample {sample_idx+1:2d}: {''.join(sample)}")
+
