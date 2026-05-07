@@ -205,6 +205,8 @@ microgpt_extension/
 │   ├── alibi.py        # Attention with Linear Biases
 │   ├── t5_bias.py      # T5-style relative positional bias
 │   ├── flash.py        # Flash Attention
+│   ├── mtp_naive.py    # Multi-Token Prediction (MTP)
+│   ├── moe.py          # Mixture of Experts (MoE)
 │   └── xpos.py         # xPOS (extrapolation-friendly positions)
 ├── src.py              # Core algorithm and utilities (dataset, BPE, etc.)
 ├── utils.py            # Value class for autograd
@@ -231,8 +233,9 @@ To train or experiment with a specific model architecture, simply use the `--mod
 | Category | Features |
 |---------|----------|
 | Tokenization | BPE |
-| Attention | Standard MHA, Flash Attention, MQA, GQA |
+| Attention | Standard MHA, Flash Attention, MQA, GQA, MoE |
 | Positional Encoding | Learned, RoPE, ALiBi, T5 Bias, xPOS |
+| Prediction | Single-token, Multi-Token (MTP) |
 | Training | GPT training loop with model selection |
 | Inference | Autoregressive decoding |
 
@@ -303,8 +306,15 @@ python3 train.py --model t5_bias
 # Train with Flash Attention
 python3 train.py --model flash
 
+
 # Train with xPOS
 python3 train.py --model xpos
+
+# Train with Mixture of Experts
+python3 train.py --model moe
+
+# Train with Multi-Token Prediction
+python3 train.py --model mtp_naive
 
 # Customize training steps and samples
 python3 train.py --model rope --num-steps 1000 --num-samples 50
@@ -312,7 +322,25 @@ python3 train.py --model rope --num-steps 1000 --num-samples 50
 
 ### Command Line Arguments
 
-- `--model {baseline,rope,alibi,t5_bias,flash,xpos}`: Choose model architecture (default: baseline)
+- `--model {baseline,rope,alibi,t5_bias,flash,xpos,moe,mtp_naive}`: Choose model architecture (default: baseline)
+---
+
+## Mixture of Experts (MoE)
+
+Implements a dense Mixture of Experts transformer block. Each layer contains a gating network and multiple expert MLPs. The gating network learns to route tokens to different experts, allowing specialization and improved model capacity without a proportional increase in compute per token.
+
+**Why it matters:**
+MoE architectures are a key technique for scaling LLMs efficiently, enabling models to grow in parameter count while keeping inference cost manageable.
+
+---
+
+## Multi-Token Prediction (MTP)
+
+Enables the model to predict multiple future tokens from the same state, rather than just the next token. This is useful for multi-horizon prediction, efficiency experiments, and understanding how models can be trained to anticipate longer sequences in parallel.
+
+**Why it matters:**
+MTP is an active research area for improving training efficiency and exploring richer supervision signals in language modeling.
+
 - `--num-steps`: Number of training steps (default: 500)
 - `--num-samples`: Number of inference samples to generate (default: 20)
 
