@@ -6,6 +6,7 @@ from .t5_bias import gpt_t5_bias
 from .flash import gpt_flash
 from .xpos import gpt_xpos
 from .mtp_naive import gpt_mtp_naive
+from .moe import gpt_moe
 
 MODEL_REGISTRY = {
     "baseline": gpt_baseline,
@@ -14,7 +15,8 @@ MODEL_REGISTRY = {
     "t5_bias": gpt_t5_bias,
     "flash": gpt_flash,
     "xpos": gpt_xpos,
-    "mtp_naive": gpt_mtp_naive
+    "mtp_naive": gpt_mtp_naive,
+    "moe": gpt_moe
 }
 
 __all__ = ["MODEL_REGISTRY"]
