@@ -15,8 +15,8 @@ random.seed(42) # Let there be order among chaos
 if not os.path.exists('input.txt'):
     import urllib.request
     names_url = 'https://raw.githubusercontent.com/karpathy/makemore/988aa59/names.txt'
-    urllib.request.urlretrieve(names_url, 'input.txt')
-docs = [line.strip() for line in open('input.txt') if line.strip()]
+    urllib.request.urlretrieve(names_url, 'input_indian.txt')
+docs = [line.strip() for line in open('input_indian.txt') if line.strip()]
 random.shuffle(docs)
 print(f"num docs: {len(docs)}")
 
@@ -88,7 +88,7 @@ print(f"vocab size after BPE: {vocab_size}")
 print(f'Encodings map : {encoding}')
 
 # Initialize the parameters, to store the knowledge of the model
-n_layer = 1     # depth of the transformer neural network (number of layers)
+n_layer = 2     # depth of the transformer neural network (number of layers)
 n_embd = 16     # width of the network (embedding dimension)
 block_size = 16 # maximum context length of the attention window (note: the longest name is 15 characters)
 n_head = 4      # number of attention heads
@@ -97,7 +97,8 @@ assert n_head % n_group == 0, "number of heads must be divisible by number of n_
 heads_per_group = n_head // n_group
 head_dim = n_embd // n_head # derived dimension of each head
 kv_chunk_size = 2 # number of groups to process together for efficiency (e.g. 2 groups = 2*head_dim dims for k and v)
-n_tokens = 3 # for multi-token prediction
+n_tokens = 1 # for multi-token prediction
+n_experts = 3 # for MoE
 matrix = lambda nout, nin, std=0.08: [[Value(random.gauss(0, std)) for _ in range(nin)] for _ in range(nout)]
 state_dict = {'wte': matrix(vocab_size, n_embd), 'wpe': matrix(block_size, n_embd), 'lm_head': matrix(vocab_size, n_embd)}
 for i in range(2, n_tokens+1) :
@@ -110,6 +111,10 @@ for i in range(n_layer):
     state_dict[f'layer{i}.mlp_fc1'] = matrix(4 * n_embd, n_embd)
     state_dict[f'layer{i}.mlp_fc2'] = matrix(n_embd, 4 * n_embd)
     state_dict[f'layer{i}.rel_pos_bias'] = matrix(n_head, 2*block_size+1) # T5-style relative positional bias: one value per head per relative distance
+    state_dict[f'layer{i}.moe_gate'] = matrix(n_experts, n_embd) # for MoE - gating network to select which expert to use
+    for j in range(n_experts) :
+        state_dict[f'layer{i}.moe_expert_{j+1}_fc1'] = matrix(2 * n_embd, n_embd)
+        state_dict[f'layer{i}.moe_expert_{j+1}_fc2'] = matrix(n_embd, 2 * n_embd) # for MoE - each expert has its own 2-layer MLP
 params = [p for mat in state_dict.values() for row in mat for p in row] # flatten params into a single list[Value]
 print(f"num params: {len(params)}")
 
@@ -204,6 +209,60 @@ def gpt(token_id, pos_id, keys, values):
         x = [xi.relu() for xi in x]
         x = linear(x, state_dict[f'layer{li}.mlp_fc2'])
         x = [a + b for a, b in zip(x, x_residual)]
+
+    logits = linear(x, state_dict['lm_head'])
+    return logits
+
+def gpt_moe(token_id, pos_id, keys, values):
+    tok_emb = state_dict['wte'][token_id] # token embedding
+    pos_emb = state_dict['wpe'][pos_id] # position embedding
+    x = [t + p for t, p in zip(tok_emb, pos_emb)] # joint token and position embedding
+    # x = [t for t, p in zip(tok_emb, pos_emb)] # not adding PE
+    x = rmsnorm(x) # note: not redundant due to backward pass via the residual connection
+
+    for li in range(n_layer):
+        # 1) Multi-head Attention block
+        x_residual = x
+        x = rmsnorm(x)
+        q = linear(x, state_dict[f'layer{li}.attn_wq'])
+        k = linear(x, state_dict[f'layer{li}.attn_wk'])
+        v = linear(x, state_dict[f'layer{li}.attn_wv'])
+        keys[li].append(k)
+        values[li].append(v)
+        x_attn = []
+        for h in range(n_head):
+            hs = h * head_dim
+            hs_kv = (h // heads_per_group) * head_dim
+            q_h = q[hs:hs+head_dim]
+            k_h = [ki[hs_kv:hs_kv+head_dim] for ki in keys[li]]
+            v_h = [vi[hs_kv:hs_kv+head_dim] for vi in values[li]]
+            attn_logits = [sum(q_h[j] * k_h[t][j] for j in range(head_dim)) / head_dim**0.5 for t in range(len(k_h))]
+            attn_weights = softmax(attn_logits)
+            head_out = [sum(attn_weights[t] * v_h[t][j] for t in range(len(v_h))) for j in range(head_dim)]
+            x_attn.extend(head_out)
+        x = linear(x_attn, state_dict[f'layer{li}.attn_wo'])
+        x = [a + b for a, b in zip(x, x_residual)]
+
+        # 2) Gating
+        x_residual = x
+        x = rmsnorm(x)
+        logits = linear(x, state_dict[f'layer{li}.moe_gate'])
+        gate_weights = softmax(logits)
+
+        # 3) getting expert outputs
+        expert_outputs = []
+        for j in range(n_experts) :
+            expert_x = linear(x, state_dict[f'layer{li}.moe_expert_{j+1}_fc1'])
+            expert_x = [xi.relu() for xi in expert_x]
+            expert_x = linear(expert_x, state_dict[f'layer{li}.moe_expert_{j+1}_fc2'])
+            expert_outputs.append(expert_x)
+
+        # combining the expert outputs according to the gate weights
+        x = [sum(gate_weights[j] * expert_outputs[j][i] for j in range(n_experts)) for i in range(n_embd)]
+        x = [a + b for a, b in zip(x, x_residual)]
+
+        # analysis, remove later
+        gate_weights_global.append([x.data for x in gate_weights])
 
     logits = linear(x, state_dict['lm_head'])
     return logits
@@ -506,6 +565,7 @@ v = [0.0] * len(params) # second moment buffer
 
 # Repeat in sequence
 num_steps = 500 # number of training steps
+gate_weights_global = [] # for analysis of MoE gating, remove later
 for step in range(num_steps):
 
     # Take single document, tokenize it, surround it with BOS special token on both sides
@@ -520,8 +580,8 @@ for step in range(num_steps):
     for pos_id in range(n):
         token_id, target_id = tokens[pos_id], tokens[pos_id + 1]
         target_ids = [target_id] + [tokens[pos_id + i] if pos_id + i < len(tokens) else None for i in range(2, n_tokens + 1)]
-
-        logits = gpt_mtp_naive(token_id, pos_id, keys, values)
+        
+        logits = gpt(token_id, pos_id, keys, values)
         if isinstance(logits[0], list) :
             loss_t = 0.0
             probs = [softmax(logits[i]) for i in range(len(logits))] # compute probabilities for each token
@@ -551,6 +611,64 @@ for step in range(num_steps):
 print()
 print(f'Minimum loss: {min(losses).data:.4f}')
 
+# plotting, remove later
+# import os
+# import numpy as np
+# import matplotlib.pyplot as plt
+
+# os.makedirs("plots", exist_ok=True)
+
+# gate_weights = np.array(gate_weights_global)
+# num_steps, num_experts = gate_weights.shape
+
+# window = 20  # try 10, 20, 50 etc.
+
+# def moving_average(x, w):
+#     return np.convolve(x, np.ones(w) / w, mode='valid')
+
+# smoothed = np.array([
+#     moving_average(gate_weights[:, i], window)
+#     for i in range(num_experts)
+# ])
+
+# x = np.arange(window - 1, num_steps)
+
+# plt.figure(figsize=(12, 6))
+
+# for i in range(num_experts):
+#     plt.plot(x, smoothed[i], label=f'Expert {i}')
+
+# plt.xlabel("Training Step")
+# plt.ylabel("Average Gate Weight")
+# plt.title(f"Expert Usage Over Time (Moving Avg Window={window})")
+# plt.legend()
+# plt.grid(True)
+
+# plt.tight_layout()
+# plt.savefig("plots/gate_weights.jpg", dpi=300)
+# plt.close()
+
+# stack = smoothed / (smoothed.sum(axis=0, keepdims=True) + 1e-8)
+
+# plt.figure(figsize=(12, 6))
+
+# plt.stackplot(
+#     x,
+#     stack,
+#     labels=[f'Expert {i}' for i in range(num_experts)]
+# )
+
+# plt.xlabel("Training Step")
+# plt.ylabel("Normalized Usage")
+# plt.title(f"Relative Expert Utilization (Window={window})")
+# plt.legend(loc='upper left')
+
+# plt.tight_layout()
+# plt.savefig("plots/gate_weights_stacked.jpg", dpi=300)
+# plt.close()
+
+###########
+
 # Inference: may the model babble back to us
 temperature = 0.5 # in (0, 1], control the "creativity" of generated text, low to high
 print("\n--- inference (new, hallucinated names) ---")
@@ -559,7 +677,7 @@ for sample_idx in range(20):
     token_id = BOS
     sample = []
     for pos_id in range(block_size):
-        logits = gpt_mtp_naive(token_id, pos_id, keys, values)
+        logits = gpt(token_id, pos_id, keys, values)
         if isinstance(logits[0], list) : logits = logits[0]
         probs = softmax([l / temperature for l in logits])
         token_id = random.choices(range(vocab_size), weights=[p.data for p in probs])[0]
