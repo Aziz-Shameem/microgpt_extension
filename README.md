@@ -276,12 +276,12 @@ and
 
 Potential additions:
 
-- Mixture of Experts
+- Mixture of Experts. - topK routing, load balancing, load free strategies
 - Sliding Window Attention
 - Speculative Decoding
 - State Space Models
 - YaRN / NTK RoPE scaling
-- Multi-token prediction
+- Multi-token prediction - causal masking
 - Prefix LM masking
 
 ---
@@ -323,6 +323,8 @@ python3 train.py --model rope --num-steps 1000 --num-samples 50
 ### Command Line Arguments
 
 - `--model {baseline,rope,alibi,t5_bias,flash,xpos,moe,mtp_naive}`: Choose model architecture (default: baseline)
+- `--num-steps`: Number of training steps (default: 500)
+- `--num-samples`: Number of inference samples to generate (default: 20)
 ---
 
 ## Mixture of Experts (MoE)
@@ -341,8 +343,34 @@ Enables the model to predict multiple future tokens from the same state, rather 
 **Why it matters:**
 MTP is an active research area for improving training efficiency and exploring richer supervision signals in language modeling.
 
-- `--num-steps`: Number of training steps (default: 500)
-- `--num-samples`: Number of inference samples to generate (default: 20)
+## Contributing
+
+Contributions are welcome - especially implementations of modern transformer ideas, architectural experiments, optimization techniques, or educational improvements (not to mention bug-fixes :p)
+
+If you'd like to contribute:
+
+1. Fork the repository
+2. Create a feature branch
+3. Keep implementations modular and readable
+4. Add clear comments explaining the intuition behind the implementation
+5. Submit a pull request with:
+   - what was added
+   - why it matters
+   - relevant papers/resources (if applicable)
+
+### Contribution Guidelines
+
+- Prioritize clarity over heavy abstraction
+- Keep dependencies to zero (use native python only)
+- Try to preserve the educational nature of the codebase
+- No framework magic - explicit tensor operations whereever applicable
+- If adding a new architecture:
+  - place it inside `models/`
+  - register it in `models/__init__.py`
+  - add usage instructions to the README
+
+Good contributions are not limited to major features. Bug fixes, refactors, documentation improvements, visualizations, and training experiments are equally valuable.
+
 
 ---
 
