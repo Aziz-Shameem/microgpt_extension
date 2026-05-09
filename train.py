@@ -7,7 +7,7 @@ from models import MODEL_REGISTRY
 from utils import Value, softmax
 
 def call_model(model_fn, token_id, pos_id, keys, values, state_dict, n_layer, n_head, 
-               head_dim, heads_per_group, n_tokens, n_embd, block_size, kv_chunk_size):
+               head_dim, heads_per_group, n_tokens, n_embd, block_size, kv_chunk_size, n_experts, expert_sparsity):
     """Wrapper to call model functions with the correct parameters."""
     # Get model name by checking function name
     model_name = model_fn.__name__.replace('gpt_', '')
@@ -33,6 +33,9 @@ def call_model(model_fn, token_id, pos_id, keys, values, state_dict, n_layer, n_
     elif model_name == 'mtp_naive':
         return model_fn(token_id, pos_id, keys, values, state_dict, n_layer, n_head, 
                        head_dim, heads_per_group, n_tokens)
+    elif model_name == 'moe':
+        return model_fn(token_id, pos_id, keys, values, state_dict, n_layer, n_head, 
+                        head_dim, heads_per_group, n_embd, n_experts, expert_sparsity)
     else:
         raise ValueError(f"Unknown model: {model_name}")
 
@@ -132,6 +135,9 @@ heads_per_group = n_head // n_group
 head_dim = n_embd // n_head # derived dimension of each head
 kv_chunk_size = 2 # for FlashAttention - number of groups to process together for efficiency (e.g. 2 groups = 2*head_dim dims for k and v)
 n_tokens = 3 # for multi-token prediction
+n_experts = 3 # for MoE
+expert_sparsity = 2 # number of experts each token is routed to
+expert_sparsity = max(1, min(expert_sparsity, n_experts)) # clipping to [1, n_experts]
 matrix = lambda nout, nin, std=0.08: [[Value(random.gauss(0, std)) for _ in range(nin)] for _ in range(nout)]
 state_dict = {
     'wte': matrix(vocab_size, n_embd), 
@@ -148,6 +154,10 @@ for i in range(n_layer):
     state_dict[f'layer{i}.mlp_fc1'] = matrix(4 * n_embd, n_embd)
     state_dict[f'layer{i}.mlp_fc2'] = matrix(n_embd, 4 * n_embd)
     state_dict[f'layer{i}.rel_pos_bias'] = matrix(n_head, 2*block_size+1) # T5-style relative positional bias
+    state_dict[f'layer{i}.moe_gate'] = matrix(n_experts, n_embd) # for MoE - gating network to select which expert to use
+    for j in range(n_experts) :
+        state_dict[f'layer{i}.moe_expert_{j+1}_fc1'] = matrix(2 * n_embd, n_embd)
+        state_dict[f'layer{i}.moe_expert_{j+1}_fc2'] = matrix(n_embd, 2 * n_embd) # for MoE - each expert has its own 2-layer MLP
 
 params = [p for mat in state_dict.values() for row in mat for p in row] # flatten params into a single list[Value]
 print(f"num params: {len(params)}")
@@ -183,7 +193,7 @@ def main():
 
             # Call the model with the wrapper function
             logits = call_model(model_fn, token_id, pos_id, keys, values, state_dict, n_layer, n_head, 
-                              head_dim, heads_per_group, n_tokens, n_embd, block_size, kv_chunk_size)
+                              head_dim, heads_per_group, n_tokens, n_embd, block_size, kv_chunk_size, n_experts, expert_sparsity)
             
             if isinstance(logits[0], list) :
                 loss_t = 0.0
@@ -224,7 +234,7 @@ def main():
         sample = []
         for pos_id in range(block_size):
             logits = call_model(model_fn, token_id, pos_id, keys, values, state_dict, n_layer, n_head, 
-                              head_dim, heads_per_group, n_tokens, n_embd, block_size, kv_chunk_size)
+                              head_dim, heads_per_group, n_tokens, n_embd, block_size, kv_chunk_size, n_experts, expert_sparsity)
             if isinstance(logits[0], list) : logits = logits[0] # using only the next token prediction
             probs = softmax([l / temperature for l in logits])
             token_id = random.choices(range(vocab_size), weights=[p.data for p in probs])[0]

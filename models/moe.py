@@ -1,8 +1,8 @@
 """GPT model with (Dense) Mixture of Experts Architecture."""
 import math
-from utils import linear, softmax, rmsnorm
+from utils import Value, linear, softmax, rmsnorm
 
-def gpt_moe(token_id, pos_id, keys, values, state_dict, n_layer, n_head, head_dim, heads_per_group, n_embd, n_experts):
+def gpt_moe(token_id, pos_id, keys, values, state_dict, n_layer, n_head, head_dim, heads_per_group, n_embd, n_experts, expert_sparsity):
     tok_emb = state_dict['wte'][token_id] # token embedding
     pos_emb = state_dict['wpe'][pos_id] # position embedding
     x = [t + p for t, p in zip(tok_emb, pos_emb)] # joint token and position embedding
@@ -36,6 +36,15 @@ def gpt_moe(token_id, pos_id, keys, values, state_dict, n_layer, n_head, head_di
         x_residual = x
         x = rmsnorm(x)
         logits = linear(x, state_dict[f'layer{li}.moe_gate'])
+        
+        # sparisification
+        hs = {} # hash map, value->gate_index
+        for i, logit in enumerate(logits) : hs[logit] = i
+        hs = dict(sorted(hs.items(), key=lambda x:x[0])) # sort by keys
+        for i, index in enumerate(hs.values()) :
+            if i<expert_sparsity : continue
+            logits[index] = Value(-float('inf')) # masking all other expert logits
+
         gate_weights = softmax(logits)
 
         # 3) getting expert outputs
@@ -45,6 +54,7 @@ def gpt_moe(token_id, pos_id, keys, values, state_dict, n_layer, n_head, head_di
             expert_x = [xi.relu() for xi in expert_x]
             expert_x = linear(expert_x, state_dict[f'layer{li}.moe_expert_{j+1}_fc2'])
             expert_outputs.append(expert_x)
+
 
         # combining the expert outputs according to the gate weights
         x = [sum(gate_weights[j] * expert_outputs[j][i] for j in range(n_experts)) for i in range(n_embd)]

@@ -99,6 +99,8 @@ head_dim = n_embd // n_head # derived dimension of each head
 kv_chunk_size = 2 # number of groups to process together for efficiency (e.g. 2 groups = 2*head_dim dims for k and v)
 n_tokens = 1 # for multi-token prediction
 n_experts = 3 # for MoE
+expert_sparsity = 2 # number of experts each token is routed to
+expert_sparsity = max(1, min(expert_sparsity, n_experts)) # clipping to [1, n_experts]
 matrix = lambda nout, nin, std=0.08: [[Value(random.gauss(0, std)) for _ in range(nin)] for _ in range(nout)]
 state_dict = {'wte': matrix(vocab_size, n_embd), 'wpe': matrix(block_size, n_embd), 'lm_head': matrix(vocab_size, n_embd)}
 for i in range(2, n_tokens+1) :
@@ -247,6 +249,15 @@ def gpt_moe(token_id, pos_id, keys, values):
         x_residual = x
         x = rmsnorm(x)
         logits = linear(x, state_dict[f'layer{li}.moe_gate'])
+        
+        # sparisification
+        hs = {} # hash map, value->gate_index
+        for i, logit in enumerate(logits) : hs[logit] = i
+        hs = dict(sorted(hs.items(), key=lambda x:x[0])) # sort by keys
+        for i, index in enumerate(hs.values()) :
+            if i<expert_sparsity : continue
+            logits[index] = Value(-float('inf')) # masking all other expert logits
+
         gate_weights = softmax(logits)
 
         # 3) getting expert outputs
@@ -256,6 +267,7 @@ def gpt_moe(token_id, pos_id, keys, values):
             expert_x = [xi.relu() for xi in expert_x]
             expert_x = linear(expert_x, state_dict[f'layer{li}.moe_expert_{j+1}_fc2'])
             expert_outputs.append(expert_x)
+
 
         # combining the expert outputs according to the gate weights
         x = [sum(gate_weights[j] * expert_outputs[j][i] for j in range(n_experts)) for i in range(n_embd)]
@@ -581,7 +593,7 @@ for step in range(num_steps):
         token_id, target_id = tokens[pos_id], tokens[pos_id + 1]
         target_ids = [target_id] + [tokens[pos_id + i] if pos_id + i < len(tokens) else None for i in range(2, n_tokens + 1)]
         
-        logits = gpt(token_id, pos_id, keys, values)
+        logits = gpt_moe(token_id, pos_id, keys, values)
         if isinstance(logits[0], list) :
             loss_t = 0.0
             probs = [softmax(logits[i]) for i in range(len(logits))] # compute probabilities for each token
@@ -677,7 +689,7 @@ for sample_idx in range(20):
     token_id = BOS
     sample = []
     for pos_id in range(block_size):
-        logits = gpt(token_id, pos_id, keys, values)
+        logits = gpt_moe(token_id, pos_id, keys, values)
         if isinstance(logits[0], list) : logits = logits[0]
         probs = softmax([l / temperature for l in logits])
         token_id = random.choices(range(vocab_size), weights=[p.data for p in probs])[0]
