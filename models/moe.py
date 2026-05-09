@@ -1,4 +1,4 @@
-"""GPT model with (Dense) Mixture of Experts Architecture."""
+"""GPT model with Mixture of Experts Architecture."""
 import math
 from utils import Value, linear, softmax, rmsnorm
 
