@@ -139,33 +139,51 @@ n_experts = 3 # for MoE
 expert_sparsity = 2 # number of experts each token is routed to
 expert_sparsity = max(1, min(expert_sparsity, n_experts)) # clipping to [1, n_experts]
 matrix = lambda nout, nin, std=0.08: [[Value(random.gauss(0, std)) for _ in range(nin)] for _ in range(nout)]
-state_dict = {
-    'wte': matrix(vocab_size, n_embd), 
-    'wpe': matrix(block_size, n_embd), 
-    'lm_head': matrix(vocab_size, n_embd)
-    }
-for i in range(2, n_tokens+1) :
-    state_dict[f'lm_head{i}'] = matrix(vocab_size, n_embd) # for mtp
-for i in range(n_layer):
-    state_dict[f'layer{i}.attn_wq'] = matrix(n_embd, n_embd)
-    state_dict[f'layer{i}.attn_wk'] = matrix(n_embd, n_group*head_dim)
-    state_dict[f'layer{i}.attn_wv'] = matrix(n_embd, n_group*head_dim)
-    state_dict[f'layer{i}.attn_wo'] = matrix(n_embd, n_embd)
-    state_dict[f'layer{i}.mlp_fc1'] = matrix(4 * n_embd, n_embd)
-    state_dict[f'layer{i}.mlp_fc2'] = matrix(n_embd, 4 * n_embd)
-    state_dict[f'layer{i}.rel_pos_bias'] = matrix(n_head, 2*block_size+1) # T5-style relative positional bias
-    state_dict[f'layer{i}.moe_gate'] = matrix(n_experts, n_embd) # for MoE - gating network to select which expert to use
-    for j in range(n_experts) :
-        state_dict[f'layer{i}.moe_expert_{j+1}_fc1'] = matrix(2 * n_embd, n_embd)
-        state_dict[f'layer{i}.moe_expert_{j+1}_fc2'] = matrix(n_embd, 2 * n_embd) # for MoE - each expert has its own 2-layer MLP
+state_dict = {} # dictionary to hold all model parameters, organized by layer and function
+params = [] # list to hold all parameters for easy access during optimization
 
-params = [p for mat in state_dict.values() for row in mat for p in row] # flatten params into a single list[Value]
-print(f"num params: {len(params)}")
+# modularizing the weight initialization to be called after model selection, since different models have different parameters 
+# (e.g. MTP has multiple lm_head's, MoE has gating and expert parameters, etc.)
+def populate_weights(model_name):
+    global state_dict, params
+
+    state_dict = {
+        'wte': matrix(vocab_size, n_embd),
+        'wpe': matrix(block_size, n_embd),
+        'lm_head': matrix(vocab_size, n_embd),
+    }
+
+    if model_name == 'mtp_naive':
+        for i in range(2, n_tokens + 1):
+            state_dict[f'lm_head{i}'] = matrix(vocab_size, n_embd)
+
+    for i in range(n_layer):
+        state_dict[f'layer{i}.attn_wq'] = matrix(n_embd, n_embd)
+        state_dict[f'layer{i}.attn_wk'] = matrix(n_embd, n_group * head_dim)
+        state_dict[f'layer{i}.attn_wv'] = matrix(n_embd, n_group * head_dim)
+        state_dict[f'layer{i}.attn_wo'] = matrix(n_embd, n_embd)
+        if model_name != 'moe' :
+            state_dict[f'layer{i}.mlp_fc1'] = matrix(4 * n_embd, n_embd)
+            state_dict[f'layer{i}.mlp_fc2'] = matrix(n_embd, 4 * n_embd)
+
+        if model_name == 't5_bias':
+            state_dict[f'layer{i}.rel_pos_bias'] = matrix(n_head, 2 * block_size + 1)
+
+        if model_name == 'moe':
+            state_dict[f'layer{i}.moe_gate'] = matrix(n_experts, n_embd)
+            for j in range(n_experts):
+                state_dict[f'layer{i}.moe_expert_{j+1}_fc1'] = matrix(2 * n_embd, n_embd)
+                state_dict[f'layer{i}.moe_expert_{j+1}_fc2'] = matrix(n_embd, 2 * n_embd)
+
+    params = [p for mat in state_dict.values() for row in mat for p in row]
+    print(f"num params: {len(params)}")
 
 # Adam params
-learning_rate, beta1, beta2, eps_adam = 0.01, 0.85, 0.99, 1e-8
-m = [0.0] * len(params) # first moment buffer
-v = [0.0] * len(params) # second moment buffer
+def adam_params() :
+    learning_rate, beta1, beta2, eps_adam = 0.01, 0.85, 0.99, 1e-8
+    m = [0.0] * len(params) # first moment buffer
+    v = [0.0] * len(params) # second moment buffer
+    return learning_rate, beta1, beta2, eps_adam, m, v
 
 def main():
     args = parse_args()
@@ -174,6 +192,12 @@ def main():
     model_fn = MODEL_REGISTRY[args.model]
     print(f"\nUsing model: {args.model}")
     print(f"Training for {args.num_steps} steps\n")
+
+    # populating the state dict
+    populate_weights(args.model)
+
+    # Adam optimizer parameters
+    learning_rate, beta1, beta2, eps_adam, m, v = adam_params()
     
     # Repeat in sequence
     num_steps = args.num_steps
